@@ -1,38 +1,24 @@
 describe("forward-auth", function()
-  local action
-  local response
-  local request_options
-  local client_error
+  local action, response, request_options, client_error
+  local environment, original_getenv
 
   local function values(entries)
     local result = {}
-    for name, value in pairs(entries or {}) do
-      result[name] = { [0] = value }
-    end
+    for name, value in pairs(entries or {}) do result[name] = { [0] = value } end
     return result
   end
 
   local function transaction(options)
     options = options or {}
     local headers = values(options.headers or { host = "app.example.com" })
-    local txn = {
-      vars = {},
-      warnings = {},
-      deleted_headers = {},
-      set_headers = {},
-    }
-
+    local txn = { vars = {}, warnings = {}, deleted_headers = {}, set_headers = {} }
     txn.http = {
-      req_get_headers = function()
-        return headers
-      end,
+      req_get_headers = function() return headers end,
       req_del_header = function(_, name)
         txn.deleted_headers[name] = true
         headers[name] = nil
       end,
-      req_set_header = function(_, name, value)
-        txn.set_headers[name] = value
-      end,
+      req_set_header = function(_, name, value) txn.set_headers[name] = value end,
     }
     txn.sf = {
       method = function() return options.method or "GET" end,
@@ -45,11 +31,17 @@ describe("forward-auth", function()
     return txn
   end
 
+  local function load_action(overrides)
+    environment = { FORWARD_AUTH_URL = "http://auth.example.test/check" }
+    for name, value in pairs(overrides or {}) do environment[name] = value end
+    os.getenv = function(name) return environment[name] end
+    dofile("forward-auth.lua")
+  end
+
   before_each(function()
-    action = nil
+    action, request_options, client_error = nil, nil, nil
     response = { status = 204, headers = {} }
-    request_options = nil
-    client_error = nil
+    original_getenv = os.getenv
     _G.core = {
       register_action = function(name, contexts, callback)
         assert.are.equal("forward-auth", name)
@@ -57,49 +49,39 @@ describe("forward-auth", function()
         action = callback
       end,
       httpclient = function()
-        return {
-          head = function(_, options)
-            request_options = options
-            if client_error then error(client_error) end
-            return response
-          end,
-        }
+        local function request(_, options)
+          request_options = options
+          if client_error then error(client_error) end
+          return response
+        end
+        return { get = request, head = request }
       end,
     }
-    dofile("forward-auth.lua")
   end)
 
   after_each(function()
+    os.getenv = original_getenv
     _G.core = nil
   end)
 
   it("registers the HAProxy request action", function()
+    load_action()
     assert.is_function(action)
   end)
 
-  it("allows successful authentication and propagates trusted identity", function()
-    response = { status = 200, headers = values({
-      ["x-authentik-username"] = "alice",
-      ["set-cookie"] = "auth=refreshed; Secure",
-    }) }
+  it("allows 2xx and sends only allowlisted headers", function()
+    load_action()
     local txn = transaction({ headers = {
       host = "App.Example.com:443",
-      cookie = "auth=old",
+      cookie = "session=old",
       authorization = "Bearer token",
-      ["user-agent"] = "test-agent",
-      accept = "text/html",
       upgrade = "websocket",
       ["sec-websocket-key"] = "secret",
-      ["x-authentik-username"] = "mallory",
     } })
-
     action(txn)
-
     assert.are.equal("allow", txn.vars["txn.forward_auth_result"])
-    assert.are.equal("alice", txn.set_headers["x-authentik-username"])
-    assert.are.equal("auth=refreshed; Secure", txn.vars["txn.forward_auth_set_cookie"])
-    assert.is_true(txn.deleted_headers["x-authentik-username"])
-    assert.are.equal("http://127.0.0.1:10080/outpost.goauthentik.io/auth/nginx", request_options.url)
+    assert.are.equal(204, txn.vars["txn.forward_auth_status"])
+    assert.are.equal("http://auth.example.test/check", request_options.url)
     assert.are.equal(3000, request_options.timeout)
     assert.are.same({ "app.example.com" }, request_options.headers.host)
     assert.are.same({ "https://app.example.com/private?a=b" }, request_options.headers["x-original-url"])
@@ -109,64 +91,95 @@ describe("forward-auth", function()
     assert.is_nil(request_options.headers["sec-websocket-key"])
   end)
 
-  it("turns a 401 into an encoded authentik sign-in redirect", function()
-    response = { status = 401, headers = values({ ["set-cookie"] = "session=new" }) }
-    local txn = transaction({ url = "/private path?q=a&b=c" })
-
+  it("supports HEAD and custom request headers", function()
+    load_action({
+      FORWARD_AUTH_METHOD = "HEAD",
+      FORWARD_AUTH_TIMEOUT_MS = "1500",
+      FORWARD_AUTH_REQUEST_HEADERS = "cookie, x-api-key",
+    })
+    local txn = transaction({ headers = {
+      host = "app.example.com",
+      authorization = "do-not-forward",
+      ["x-api-key"] = "secret",
+    } })
     action(txn)
-
-    assert.are.equal("unauthorized", txn.vars["txn.forward_auth_result"])
-    assert.are.equal(
-      "/outpost.goauthentik.io/start?rd=https%3A%2F%2Fapp.example.com%2Fprivate%20path%3Fq%3Da%26b%3Dc",
-      txn.vars["txn.forward_auth_location"]
-    )
-    assert.are.equal("session=new", txn.vars["txn.forward_auth_set_cookie"])
+    assert.are.equal(1500, request_options.timeout)
+    assert.are.same({ "secret" }, request_options.headers["x-api-key"])
+    assert.is_nil(request_options.headers.authorization)
   end)
 
-  it("preserves an absolute same-origin HTTP/2 URL", function()
-    local txn = transaction({ url = "https://app.example.com/private" })
+  it("copies allowlisted response headers to the upstream request", function()
+    load_action({ FORWARD_AUTH_UPSTREAM_HEADERS = "x-user, x-groups" })
+    response = { status = 200, headers = values({
+      ["x-user"] = "alice", ["x-groups"] = "admin,users", ["x-other"] = "ignored",
+    }) }
+    local txn = transaction({ headers = { host = "app.example.com", ["x-user"] = "mallory" } })
     action(txn)
-    assert.are.same(
-      { "https://app.example.com/private" },
-      request_options.headers["x-original-url"]
-    )
+    assert.is_true(txn.deleted_headers["x-user"])
+    assert.is_true(txn.deleted_headers["x-groups"])
+    assert.are.equal("alice", txn.set_headers["x-user"])
+    assert.are.equal("admin,users", txn.set_headers["x-groups"])
+    assert.is_nil(txn.set_headers["x-other"])
   end)
 
-  it("maps a 403 response to forbidden", function()
-    response = { status = 403, headers = {} }
+  it("captures allowlisted headers for the client response", function()
+    load_action({ FORWARD_AUTH_CLIENT_HEADERS = "set-cookie, x-auth-token" })
+    response = { status = 200, headers = values({
+      ["set-cookie"] = "session=new; Secure", ["x-auth-token"] = "new-token",
+    }) }
     local txn = transaction()
     action(txn)
-    assert.are.equal("forbidden", txn.vars["txn.forward_auth_result"])
+    assert.are.equal("session=new; Secure", txn.vars["txn.forward_auth_client_header_set_cookie"])
+    assert.are.equal("new-token", txn.vars["txn.forward_auth_client_header_x_auth_token"])
   end)
 
-  it("accepts only relative or same-origin auth redirects", function()
-    for _, location in ipairs({ "/login", "https://app.example.com/login" }) do
-      response = { status = 302, headers = values({ location = location }) }
-      local txn = transaction()
-      action(txn)
-      assert.are.equal("unauthorized", txn.vars["txn.forward_auth_result"])
-    end
-
-    for _, location in ipairs({ "//evil.example/login", "https://evil.example/login" }) do
-      response = { status = 302, headers = values({ location = location }) }
-      local txn = transaction()
-      action(txn)
-      assert.are.equal("error", txn.vars["txn.forward_auth_result"])
-    end
+  it("maps 401 and propagates WWW-Authenticate", function()
+    load_action()
+    response = { status = 401, headers = values({
+      ["www-authenticate"] = 'Basic realm="private"',
+    }) }
+    local txn = transaction()
+    action(txn)
+    assert.are.equal("unauthorized", txn.vars["txn.forward_auth_result"])
+    assert.are.equal(401, txn.vars["txn.forward_auth_status"])
+    assert.are.equal('Basic realm="private"', txn.vars["txn.forward_auth_www_authenticate"])
   end)
 
-  it("fails closed and removes spoofed identity for malformed requests", function()
+  it("maps 403 to forbidden and other statuses to error", function()
+    load_action()
+    response = { status = 403, headers = {} }
+    local forbidden = transaction()
+    action(forbidden)
+    assert.are.equal("forbidden", forbidden.vars["txn.forward_auth_result"])
+    response = { status = 302, headers = values({ location = "/login" }) }
+    local redirect = transaction()
+    action(redirect)
+    assert.are.equal("error", redirect.vars["txn.forward_auth_result"])
+    assert.are.equal(302, redirect.vars["txn.forward_auth_status"])
+  end)
+
+  it("fails closed when the auth URL is missing", function()
+    load_action({ FORWARD_AUTH_URL = "" })
+    local txn = transaction()
+    action(txn)
+    assert.are.equal("error", txn.vars["txn.forward_auth_result"])
+    assert.matches("missing%-auth%-url", txn.warnings[1])
+    assert.is_nil(request_options)
+  end)
+
+  it("removes spoofed upstream headers before malformed request errors", function()
+    load_action({ FORWARD_AUTH_UPSTREAM_HEADERS = "x-user" })
     local txn = transaction({ headers = {
-      host = "evil.example@trusted.example",
-      ["x-authentik-email"] = "attacker@example.com",
+      host = "evil.example@trusted.example", ["x-user"] = "attacker",
     } })
     action(txn)
     assert.are.equal("error", txn.vars["txn.forward_auth_result"])
-    assert.is_true(txn.deleted_headers["x-authentik-email"])
+    assert.is_true(txn.deleted_headers["x-user"])
     assert.is_nil(request_options)
   end)
 
   it("fails closed when the auth service raises an error", function()
+    load_action()
     client_error = "connection refused"
     local txn = transaction()
     action(txn)
@@ -175,9 +188,9 @@ describe("forward-auth", function()
   end)
 
   it("does not forward oversized request headers", function()
+    load_action()
     local txn = transaction({ headers = {
-      host = "app.example.com",
-      authorization = string.rep("x", 16385),
+      host = "app.example.com", authorization = string.rep("x", 16385),
     } })
     action(txn)
     assert.is_nil(request_options.headers.authorization)
